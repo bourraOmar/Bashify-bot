@@ -5,6 +5,8 @@ import html
 import logging
 import asyncio
 import subprocess
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -359,14 +361,40 @@ async def download_and_send(message, url: str):
         )
 
 
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<html><body><h1>Bot is online and running 24/7!</h1></body></html>")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_dummy_server(port):
+    try:
+        server = HTTPServer(("0.0.0.0", port), DummyHandler)
+        logger.info(f"Dummy HTTP server running on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start dummy HTTP server: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         print("[ERROR] TELEGRAM_BOT_TOKEN not set in .env file!")
         return
 
+    # Start dummy HTTP server in a background thread for Render & HuggingFace health checks
+    port = int(os.getenv("PORT", 7860))
+    http_thread = threading.Thread(target=start_dummy_server, args=(port,), daemon=True)
+    http_thread.start()
+
     print(f"[START] Starting bot with token {BOT_TOKEN[:10]}...")
     print(f"[DIR]   Downloads: {DOWNLOAD_DIR}")
     print(f"[FFMPEG] {FFMPEG_EXE}")
+    print(f"[HTTP]  Listening on port {port} (for cloud health monitoring)")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
