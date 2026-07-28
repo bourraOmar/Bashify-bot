@@ -88,8 +88,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def setup_youtube_cookies():
     """Load YouTube cookies from YOUTUBE_COOKIES_URL or split environment variables with validation."""
     cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
-    if os.path.isfile(cookies_file) and os.path.getsize(cookies_file) > 0:
-        return
+    
+    # Always re-create cookies.txt on startup to pick up fresh env vars on each deploy
+    if os.path.isfile(cookies_file):
+        os.remove(cookies_file)
 
     # Option 1: Download from a private Gist URL or Paste URL if provided (or if YOUTUBE_COOKIES holds a URL)
     cookies_url = os.getenv("YOUTUBE_COOKIES_URL", "").strip()
@@ -106,28 +108,32 @@ def setup_youtube_cookies():
                 cookies_url = cookies_url.rstrip("/") + "/raw"
                 
             logger.info(f"Downloading YouTube cookies from {cookies_url}...")
-            urllib.request.urlretrieve(cookies_url, cookies_file)
+            req = urllib.request.Request(cookies_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                content = response.read().decode("utf-8", errors="ignore")
             
-            # Validate that the downloaded file is plain text cookies, NOT an HTML webpage
-            with open(cookies_file, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read(500).strip()
-                if content.startswith("<") or ("<!DOCTYPE" in content) or ("<html" in content):
-                    logger.error("Downloaded cookies.txt appears to be an HTML webpage! Removing invalid cookie file.")
-                    os.remove(cookies_file)
-                    return
+            # Validate that the downloaded content is plain text cookies, NOT an HTML webpage
+            if content.strip().startswith("<") or "<!DOCTYPE" in content or "<html" in content:
+                logger.error("Downloaded cookies.txt appears to be an HTML webpage! Discarding.")
+                return
+            
+            with open(cookies_file, "w", encoding="utf-8") as f:
+                f.write(content)
 
-            logger.info("Successfully loaded valid cookies from YOUTUBE_COOKIES_URL into cookies.txt")
+            logger.info(f"Successfully loaded cookies from URL into cookies.txt ({os.path.getsize(cookies_file)} bytes)")
             return
         except Exception as e:
             logger.error(f"Failed to download cookies from URL: {e}")
+            return  # Don't fall through to chunk mode if a URL was provided
 
     # Option 2: Combine YOUTUBE_COOKIES, YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, etc. (bypasses 1023 char limit)
     cookie_chunks = []
-    main_cookie = os.getenv("YOUTUBE_COOKIES")
-    if main_cookie:
+    main_cookie = os.getenv("YOUTUBE_COOKIES", "").strip()
+    # Skip if main_cookie is a URL (already handled above and failed)
+    if main_cookie and not main_cookie.startswith("http"):
         cookie_chunks.append(main_cookie)
     for i in range(1, 10):
-        chunk = os.getenv(f"YOUTUBE_COOKIES_{i}")
+        chunk = os.getenv(f"YOUTUBE_COOKIES_{i}", "").strip()
         if chunk:
             cookie_chunks.append(chunk)
 
@@ -136,11 +142,33 @@ def setup_youtube_cookies():
         try:
             with open(cookies_file, "w", encoding="utf-8") as f:
                 f.write(combined_cookies.replace("\\t", "\t").replace("\\n", "\n"))
-            logger.info("Successfully saved YOUTUBE_COOKIES (combined) from environment into cookies.txt")
+            logger.info(f"Successfully saved YOUTUBE_COOKIES (combined) into cookies.txt ({os.path.getsize(cookies_file)} bytes)")
         except Exception as e:
             logger.error(f"Failed to write YOUTUBE_COOKIES to file: {e}")
 
+
+def get_cookies_status():
+    """Return a diagnostic string about the cookies file state."""
+    cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
+    if not os.path.isfile(cookies_file):
+        return "❌ No cookies.txt file found"
+    size = os.path.getsize(cookies_file)
+    if size == 0:
+        return "❌ cookies.txt exists but is empty (0 bytes)"
+    try:
+        with open(cookies_file, "r", encoding="utf-8", errors="ignore") as f:
+            first_line = f.readline().strip()
+            line_count = 1 + sum(1 for _ in f)
+        if "Netscape" in first_line or first_line.startswith("#") or "\t" in first_line or ".youtube.com" in first_line:
+            return f"✅ cookies.txt loaded ({size} bytes, {line_count} lines)"
+        else:
+            return f"⚠️ cookies.txt exists ({size} bytes) but may be invalid. First line: {first_line[:80]}"
+    except Exception as e:
+        return f"❌ Error reading cookies.txt: {e}"
+
+
 setup_youtube_cookies()
+logger.info(f"Cookie status: {get_cookies_status()}")
 
 
 def get_ydl_opts(custom_opts=None, player_clients=None, include_cookies=True):
@@ -570,6 +598,31 @@ def start_dummy_server(port):
         logger.error(f"Failed to start dummy HTTP server: {e}")
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot diagnostics: cookie status, yt-dlp version, ffmpeg."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("Sorry, this is a private bot.")
+        return
+
+    cookie_status = get_cookies_status()
+    ytdlp_version = getattr(yt_dlp, 'version', {}).get('__version__', 'unknown') if hasattr(yt_dlp, 'version') else yt_dlp.version.__version__ if hasattr(yt_dlp, 'version') else 'unknown'
+    
+    try:
+        ytdlp_version = yt_dlp.version.__version__
+    except Exception:
+        ytdlp_version = "unknown"
+
+    status_text = (
+        "🔧 <b>Bot Status</b>\n\n"
+        f"🍪 <b>Cookies:</b> {cookie_status}\n"
+        f"📦 <b>yt-dlp:</b> {ytdlp_version}\n"
+        f"🎬 <b>FFmpeg:</b> {FFMPEG_EXE}\n"
+        f"📂 <b>Downloads dir:</b> {DOWNLOAD_DIR}\n"
+    )
+    await update.message.reply_text(status_text, parse_mode="HTML")
+
+
 def main():
     if not BOT_TOKEN:
         print("[ERROR] TELEGRAM_BOT_TOKEN not set in .env file!")
@@ -583,11 +636,13 @@ def main():
     print(f"[START] Starting bot with token {BOT_TOKEN[:10]}...")
     print(f"[DIR]   Downloads: {DOWNLOAD_DIR}")
     print(f"[FFMPEG] {FFMPEG_EXE}")
+    print(f"[COOKIE] {get_cookies_status()}")
     print(f"[HTTP]  Listening on port {port} (for cloud health monitoring)")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
