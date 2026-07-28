@@ -18,8 +18,7 @@ A personal Telegram Bot built in Python that allows you to search for music or p
 Make sure your `.env` file contains your Bot Token from `@BotFather`:
 
 ```env
-TELEGRAM_BOT_TOKEN=8608855272:AAGgVOC8LwtqMui9FAlId7BgcTdl8mhS7Lc
-
+TELEGRAM_BOT_TOKEN=add tekon @oBtFather give you
 # Optional: Set your numeric Telegram User ID from @userinfobot to restrict usage to only you
 ALLOWED_USER_ID=
 ```
