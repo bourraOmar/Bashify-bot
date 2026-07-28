@@ -16,5 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy bot code
 COPY bot.py .
 
+# Expose port for cloud health monitoring (Back4App / Render)
+ENV PORT=7860
+EXPOSE 7860
+
 # Run the bot
 CMD ["python", "bot.py"]
