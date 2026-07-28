@@ -91,8 +91,13 @@ def setup_youtube_cookies():
     if os.path.isfile(cookies_file) and os.path.getsize(cookies_file) > 0:
         return
 
-    # Option 1: Download from a private Gist URL or Paste URL if provided
-    cookies_url = os.getenv("YOUTUBE_COOKIES_URL")
+    # Option 1: Download from a private Gist URL or Paste URL if provided (or if YOUTUBE_COOKIES holds a URL)
+    cookies_url = os.getenv("YOUTUBE_COOKIES_URL", "").strip()
+    if not cookies_url:
+        main_val = os.getenv("YOUTUBE_COOKIES", "").strip()
+        if main_val.startswith("http://") or main_val.startswith("https://"):
+            cookies_url = main_val
+
     if cookies_url:
         try:
             import urllib.request
