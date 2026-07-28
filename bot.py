@@ -606,8 +606,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cookie_status = get_cookies_status()
-    ytdlp_version = getattr(yt_dlp, 'version', {}).get('__version__', 'unknown') if hasattr(yt_dlp, 'version') else yt_dlp.version.__version__ if hasattr(yt_dlp, 'version') else 'unknown'
-    
     try:
         ytdlp_version = yt_dlp.version.__version__
     except Exception:
