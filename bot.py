@@ -85,15 +85,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
 
-def get_ydl_opts(custom_opts=None):
+def setup_youtube_cookies():
+    """Check if YOUTUBE_COOKIES env var exists and write it to cookies.txt securely."""
+    env_cookies = os.getenv("YOUTUBE_COOKIES")
+    cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
+    if env_cookies and not os.path.isfile(cookies_file):
+        try:
+            with open(cookies_file, "w", encoding="utf-8") as f:
+                f.write(env_cookies.replace("\\t", "\t").replace("\\n", "\n"))
+            logger.info("Successfully loaded YOUTUBE_COOKIES from environment variables into cookies.txt")
+        except Exception as e:
+            logger.error(f"Failed to write YOUTUBE_COOKIES to file: {e}")
+
+setup_youtube_cookies()
+
+
+def get_ydl_opts(custom_opts=None, player_clients=None):
     """Returns yt-dlp options configured to bypass YouTube bot detection on cloud servers."""
+    if not player_clients:
+        player_clients = ["tv_embedded", "web_embedded", "ios", "mweb", "tv", "music"]
+
     opts = {
         "quiet": True,
         "no_warnings": True,
         # Bypass 'Sign in to confirm you're not a bot' on cloud datacenter IPs (Back4App, AWS, etc.)
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "mweb", "web_creator", "tv", "web_embedded"],
+                "player_client": player_clients,
             }
         },
     }
@@ -283,16 +301,30 @@ async def download_and_send(message, url: str):
 
     timestamp = int(asyncio.get_event_loop().time())
 
-    # Step 1: Download raw audio (no postprocessors)
-    ydl_opts = get_ydl_opts({
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, f"%(id)s_{timestamp}.%(ext)s"),
-        "writethumbnail": True,
-    })
-
+    # Step 1: Download raw audio with fallback client strategies
     def _download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=True)
+        strategies = [
+            ["tv_embedded", "web_embedded"],
+            ["tv", "music"],
+            ["ios", "mweb"],
+            ["android", "android_vr"],
+            ["web_creator", "web"],
+        ]
+        last_exception = None
+        for strategy in strategies:
+            ydl_opts = get_ydl_opts({
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(DOWNLOAD_DIR, f"%(id)s_{timestamp}.%(ext)s"),
+                "writethumbnail": True,
+            }, player_clients=strategy)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=True)
+            except Exception as e:
+                last_exception = e
+                logger.warning(f"Download attempt failed with strategy {strategy}: {e}")
+                continue
+        raise last_exception or Exception("All download strategies failed.")
 
     try:
         info = await asyncio.get_event_loop().run_in_executor(None, _download)
