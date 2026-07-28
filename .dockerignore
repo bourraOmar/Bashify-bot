@@ -1,0 +1,13 @@
+.venv/
+.env
+bin/
+downloads/
+__pycache__/
+*.pyc
+*.mp3
+*.webm
+*.m4a
+debug_bot.py
+.env.example
+README.md
+.git/
