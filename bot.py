@@ -86,14 +86,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def setup_youtube_cookies():
-    """Check if YOUTUBE_COOKIES env var exists and write it to cookies.txt securely."""
-    env_cookies = os.getenv("YOUTUBE_COOKIES")
+    """Load YouTube cookies from YOUTUBE_COOKIES_URL or split environment variables."""
     cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
-    if env_cookies and not os.path.isfile(cookies_file):
+    if os.path.isfile(cookies_file):
+        return
+
+    # Option 1: Download from a private Gist URL or Paste URL if provided
+    cookies_url = os.getenv("YOUTUBE_COOKIES_URL")
+    if cookies_url:
+        try:
+            import urllib.request
+            logger.info(f"Downloading YouTube cookies from {cookies_url}...")
+            urllib.request.urlretrieve(cookies_url, cookies_file)
+            logger.info("Successfully loaded cookies from YOUTUBE_COOKIES_URL into cookies.txt")
+            return
+        except Exception as e:
+            logger.error(f"Failed to download cookies from URL: {e}")
+
+    # Option 2: Combine YOUTUBE_COOKIES, YOUTUBE_COOKIES_1, YOUTUBE_COOKIES_2, etc. (bypasses 1023 char limit)
+    cookie_chunks = []
+    main_cookie = os.getenv("YOUTUBE_COOKIES")
+    if main_cookie:
+        cookie_chunks.append(main_cookie)
+    for i in range(1, 10):
+        chunk = os.getenv(f"YOUTUBE_COOKIES_{i}")
+        if chunk:
+            cookie_chunks.append(chunk)
+
+    combined_cookies = "\n".join(cookie_chunks)
+    if combined_cookies:
         try:
             with open(cookies_file, "w", encoding="utf-8") as f:
-                f.write(env_cookies.replace("\\t", "\t").replace("\\n", "\n"))
-            logger.info("Successfully loaded YOUTUBE_COOKIES from environment variables into cookies.txt")
+                f.write(combined_cookies.replace("\\t", "\t").replace("\\n", "\n"))
+            logger.info("Successfully saved YOUTUBE_COOKIES (combined) from environment into cookies.txt")
         except Exception as e:
             logger.error(f"Failed to write YOUTUBE_COOKIES to file: {e}")
 
