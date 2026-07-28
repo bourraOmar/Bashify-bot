@@ -151,12 +151,23 @@ def get_ydl_opts(custom_opts=None, player_clients=None):
 
 
 async def search_music(query: str, count: int = TOTAL_RESULTS):
-    """Search for music using yt-dlp. Returns up to `count` results."""
+    """Search for music using SoundCloud (immune to cloud IP blocking) with YouTube fallback."""
     ydl_opts = get_ydl_opts({
         "extract_flat": "in_playlist",
     })
 
     def _search():
+        # 1. Try SoundCloud first (100% immune to Google/YouTube AWS IP bans)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(f"scsearch{count}:{query}", download=False)
+                if res and res.get("entries"):
+                    logger.info(f"SoundCloud search returned {len(res['entries'])} results.")
+                    return res
+        except Exception as e:
+            logger.warning(f"SoundCloud search errored, switching to YouTube: {e}")
+
+        # 2. Fallback to YouTube search
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(f"ytsearch{count}:{query}", download=False)
 
@@ -175,7 +186,7 @@ def format_duration(seconds):
 
 
 def build_results_page(entries, page, query):
-    """Build the inline keyboard for a specific results page."""
+    """Build the inline keyboard for a specific results page using entry indices."""
     total = len(entries)
     total_pages = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     start_idx = page * RESULTS_PER_PAGE
@@ -184,14 +195,14 @@ def build_results_page(entries, page, query):
 
     keyboard = []
 
-    # Song buttons
-    for idx, entry in enumerate(page_entries, start=start_idx + 1):
-        title = entry.get("title", "Unknown Title")
+    # Song buttons (using index in entries array for robust URL/ID resolution)
+    for idx_offset, entry in enumerate(page_entries):
+        real_idx = start_idx + idx_offset
+        title = entry.get("title") or "Unknown Title"
         duration = format_duration(entry.get("duration"))
-        video_id = entry.get("id")
-        button_label = f"{idx}. {title[:45]} ({duration})"
+        button_label = f"{real_idx + 1}. {title[:42]} ({duration})"
         keyboard.append(
-            [InlineKeyboardButton(button_label, callback_data=f"dl:{video_id}")]
+            [InlineKeyboardButton(button_label, callback_data=f"dl:{real_idx}")]
         )
 
     # Pagination row
@@ -218,6 +229,26 @@ def build_results_page(entries, page, query):
     return text, InlineKeyboardMarkup(keyboard)
 
 
+async def parse_spotify_url(url: str) -> str:
+    """Extracts song title and artist from a Spotify web page URL."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        html_page = await asyncio.get_event_loop().run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=5).read().decode("utf-8", errors="ignore"))
+        title_match = re.search(r'<meta property="og:title" content="([^"]+)"', html_page) or re.search(r'<title>([^<]+)</title>', html_page)
+        desc_match = re.search(r'<meta property="og:description" content="([^"]+)"', html_page)
+        title = html.unescape(title_match.group(1).split(" | ")[0]) if title_match else ""
+        artist = ""
+        if desc_match:
+            parts = [html.unescape(p.strip()) for p in desc_match.group(1).split("·") if p.strip().lower() != "song"]
+            if parts:
+                artist = parts[0]
+        return f"{title} {artist}".strip()
+    except Exception as e:
+        logger.error(f"Failed to parse Spotify URL: {e}")
+        return ""
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_authorized(user.id):
@@ -228,15 +259,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Direct URL
-    if re.match(r"https?://\S+", text):
+    # Spotify URL conversion
+    if re.match(r"https?://(open\.)?spotify\.com/\S+", text):
+        status_msg = await update.message.reply_text("🎵 Converting Spotify link to SoundCloud...")
+        query = await parse_spotify_url(text)
+        if not query:
+            await status_msg.edit_text("Could not read Spotify link. Please type the song name directly.")
+            return
+        await status_msg.edit_text(f"Searching SoundCloud for: <code>{html.escape(query)}</code>...", parse_mode="HTML")
+        text = query
+    elif re.match(r"https?://\S+", text):
+        # Direct URL (YouTube, SoundCloud, etc.)
         await download_and_send(update.message, text)
         return
-
-    # Search query
-    status_msg = await update.message.reply_text(
-        f"Searching for <code>{html.escape(text)}</code>...", parse_mode="HTML"
-    )
+    else:
+        status_msg = await update.message.reply_text(
+            f"Searching for <code>{html.escape(text)}</code>...", parse_mode="HTML"
+        )
 
     try:
         results_data = await search_music(text)
@@ -288,11 +327,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(msg_text, reply_markup=reply_markup, parse_mode="HTML")
         return
 
-    # Download single track
+    # Download single track from array index
     if data.startswith("dl:"):
-        video_id = data[3:]
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        await download_and_send(query.message, url)
+        idx = int(data[3:])
+        entries = context.user_data.get("results", [])
+        if idx >= len(entries):
+            await query.message.reply_text("Track not found in session. Please search again.")
+            return
+        entry = entries[idx]
+        url = entry.get("url") or entry.get("webpage_url")
+        video_id = entry.get("id", "")
+        title = entry.get("title", "")
+        artist = entry.get("uploader") or entry.get("artist", "")
+        fallback_query = f"{title} {artist}".strip()
+
+        if not url or not str(url).startswith("http"):
+            if str(video_id).isdigit():
+                url = f"https://api.soundcloud.com/tracks/{video_id}"
+            else:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+
+        await download_and_send(query.message, url, fallback_query=fallback_query)
         return
 
     # Download All (current page)
@@ -313,21 +368,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         for entry in page_entries:
-            video_id = entry.get("id")
-            if video_id:
-                url = f"https://www.youtube.com/watch?v={video_id}"
-                await download_and_send(query.message, url)
+            url = entry.get("url") or entry.get("webpage_url")
+            video_id = entry.get("id", "")
+            title = entry.get("title", "")
+            if not url or not str(url).startswith("http"):
+                if str(video_id).isdigit():
+                    url = f"https://api.soundcloud.com/tracks/{video_id}"
+                else:
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+            await download_and_send(query.message, url, fallback_query=title)
         return
 
 
-async def download_and_send(message, url: str):
+async def download_and_send(message, url: str, fallback_query: str = None):
     """Download audio with yt-dlp, convert with ffmpeg, send to Telegram."""
     status_msg = await message.reply_text("Downloading audio...")
 
     timestamp = int(asyncio.get_event_loop().time())
 
     # Step 1: Download raw audio with fallback client strategies
-    def _download():
+    def _download(target_url):
         strategies = [
             ["tv_embedded", "web_embedded"],
             ["tv", "music"],
@@ -344,15 +404,25 @@ async def download_and_send(message, url: str):
             }, player_clients=strategy)
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=True)
+                    return ydl.extract_info(target_url, download=True)
             except Exception as e:
                 last_exception = e
-                logger.warning(f"Download attempt failed with strategy {strategy}: {e}")
+                logger.warning(f"Download attempt failed with strategy {strategy} for {target_url}: {e}")
                 continue
         raise last_exception or Exception("All download strategies failed.")
 
     try:
-        info = await asyncio.get_event_loop().run_in_executor(None, _download)
+        try:
+            info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
+        except Exception as e:
+            if fallback_query and "youtube.com" in str(url):
+                logger.info(f"YouTube blocked {url}. Auto-redirecting download to SoundCloud for: {fallback_query}")
+                await status_msg.edit_text("⚠️ YouTube anti-bot block detected. Redirecting to SoundCloud...")
+                info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
+                if info and info.get("entries"):
+                    info = info["entries"][0]
+            else:
+                raise e
 
         video_id = info.get("id")
         title = info.get("title", "Audio Track")
