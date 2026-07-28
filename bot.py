@@ -85,13 +85,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
 
-async def search_music(query: str, count: int = TOTAL_RESULTS):
-    """Search for music using yt-dlp. Returns up to `count` results."""
-    ydl_opts = {
-        "extract_flat": "in_playlist",
+def get_ydl_opts(custom_opts=None):
+    """Returns yt-dlp options configured to bypass YouTube bot detection on cloud servers."""
+    opts = {
         "quiet": True,
         "no_warnings": True,
+        # Bypass 'Sign in to confirm you're not a bot' on cloud datacenter IPs (Back4App, AWS, etc.)
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "mweb", "web_creator", "tv", "web_embedded"],
+            }
+        },
     }
+    
+    cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
+    if os.path.isfile(cookies_file):
+        opts["cookiefile"] = cookies_file
+        
+    if custom_opts:
+        opts.update(custom_opts)
+    return opts
+
+
+async def search_music(query: str, count: int = TOTAL_RESULTS):
+    """Search for music using yt-dlp. Returns up to `count` results."""
+    ydl_opts = get_ydl_opts({
+        "extract_flat": "in_playlist",
+    })
 
     def _search():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -264,13 +284,11 @@ async def download_and_send(message, url: str):
     timestamp = int(asyncio.get_event_loop().time())
 
     # Step 1: Download raw audio (no postprocessors)
-    ydl_opts = {
+    ydl_opts = get_ydl_opts({
         "format": "bestaudio/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, f"%(id)s_{timestamp}.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
         "writethumbnail": True,
-    }
+    })
 
     def _download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
