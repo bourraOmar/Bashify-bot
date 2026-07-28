@@ -151,25 +151,25 @@ def get_ydl_opts(custom_opts=None, player_clients=None):
 
 
 async def search_music(query: str, count: int = TOTAL_RESULTS):
-    """Search for music using SoundCloud (immune to cloud IP blocking) with YouTube fallback."""
+    """Search for music using YouTube first (leveraging secret Gist cookies), falling back to SoundCloud."""
     ydl_opts = get_ydl_opts({
         "extract_flat": "in_playlist",
     })
 
     def _search():
-        # 1. Try SoundCloud first (100% immune to Google/YouTube AWS IP bans)
+        # 1. Try YouTube first (unrestricted artist catalog with zero SoundCloud DRM when cookies are active)
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                res = ydl.extract_info(f"scsearch{count}:{query}", download=False)
+                res = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
                 if res and res.get("entries"):
-                    logger.info(f"SoundCloud search returned {len(res['entries'])} results.")
+                    logger.info(f"YouTube search returned {len(res['entries'])} results.")
                     return res
         except Exception as e:
-            logger.warning(f"SoundCloud search errored, switching to YouTube: {e}")
+            logger.warning(f"YouTube search errored, switching to SoundCloud: {e}")
 
-        # 2. Fallback to YouTube search
+        # 2. Fallback to SoundCloud search if YouTube is unreachable
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+            return ydl.extract_info(f"scsearch{count}:{query}", download=False)
 
     return await asyncio.get_event_loop().run_in_executor(None, _search)
 
