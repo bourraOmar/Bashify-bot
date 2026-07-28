@@ -431,6 +431,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def download_via_piped(video_id: str, timestamp: int) -> dict:
+    """Download YouTube audio via Piped API instances (bypasses YouTube datacenter IP blocking)."""
+    import urllib.request
+    import json
+
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.projectsegfau.lt",
+    ]
+
+    for api_base in piped_instances:
+        try:
+            api_url = f"{api_base}/streams/{video_id}"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            title = data.get("title", "Audio Track")
+            uploader = data.get("uploader", "Unknown Artist")
+            duration = data.get("duration", 0)
+
+            # Pick highest quality audio stream
+            audio_streams = data.get("audioStreams", [])
+            if not audio_streams:
+                logger.warning(f"Piped {api_base}: no audio streams for {video_id}")
+                continue
+
+            # Sort by bitrate descending, prefer m4a/mp4 over webm
+            audio_streams.sort(key=lambda s: s.get("bitrate", 0), reverse=True)
+            best = audio_streams[0]
+            stream_url = best.get("url")
+            if not stream_url:
+                continue
+
+            # Download the audio stream directly
+            ext = "m4a" if "m4a" in best.get("mimeType", "") or "mp4" in best.get("mimeType", "") else "webm"
+            out_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_{timestamp}.{ext}")
+
+            logger.info(f"Piped {api_base}: downloading {best.get('bitrate', '?')}bps {ext} stream for {video_id}")
+            dl_req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(dl_req, timeout=60) as stream_resp:
+                with open(out_path, "wb") as f:
+                    while True:
+                        chunk = stream_resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 10000:
+                # Try to get thumbnail
+                thumb_url = data.get("thumbnailUrl", "")
+                if thumb_url:
+                    try:
+                        thumb_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_{timestamp}_thumb.jpg")
+                        t_req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(t_req, timeout=10) as t_resp:
+                            with open(thumb_path, "wb") as tf:
+                                tf.write(t_resp.read())
+                    except Exception:
+                        pass
+
+                return {
+                    "id": video_id,
+                    "title": title,
+                    "uploader": uploader,
+                    "duration": duration,
+                    "source": f"piped:{api_base}",
+                }
+
+            logger.warning(f"Piped {api_base}: downloaded file too small for {video_id}")
+        except Exception as e:
+            logger.warning(f"Piped {api_base} failed for {video_id}: {e}")
+            continue
+
+    return None
+
+
 async def download_and_send(message, url: str, fallback_query: str = None):
     """Download audio with yt-dlp, convert with ffmpeg, send to Telegram."""
     status_msg = await message.reply_text("Downloading audio...")
@@ -463,6 +541,9 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         raise last_exception or Exception("All download strategies failed.")
 
     try:
+        info = None
+
+        # Attempt 1: Direct yt-dlp download
         try:
             info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
         except Exception as e:
@@ -470,30 +551,55 @@ async def download_and_send(message, url: str, fallback_query: str = None):
             if not fallback_query and message.text and not message.text.strip().startswith("http"):
                 fallback_query = message.text.strip()
 
-            if fallback_query:
+            # Extract YouTube video ID for Piped fallback
+            yt_video_id = None
+            yt_match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", str(url))
+            if yt_match:
+                yt_video_id = yt_match.group(1)
+
+            # Attempt 2: If YouTube bot-blocked, try Piped API proxy
+            if yt_video_id and ("sign in" in err_str or "bot" in err_str or "confirm" in err_str):
+                logger.info(f"YouTube blocked {url}. Trying Piped API for video {yt_video_id}...")
+                await status_msg.edit_text("⚠️ YouTube bot block detected. Trying alternative stream...")
+                info = await download_via_piped(yt_video_id, timestamp)
+
+            # Attempt 3: SoundCloud / cross-platform fallback
+            if not info and fallback_query:
                 if "soundcloud" in str(url) or "drm" in err_str:
-                    logger.info(f"SoundCloud track blocked/DRM ({url}). Redirecting to YouTube for: {fallback_query}")
-                    await status_msg.edit_text("⚠️ SoundCloud DRM protection detected. Switching to YouTube Music stream...")
+                    logger.info(f"SoundCloud DRM ({url}). Trying YouTube for: {fallback_query}")
+                    await status_msg.edit_text("⚠️ SoundCloud DRM detected. Trying YouTube...")
                     try:
                         info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
-                    except Exception as e2:
-                        logger.warning(f"ytsearch1 failed: {e2}. Trying scsearch2 (non-DRM reupload)...")
-                        await status_msg.edit_text("⚠️ Finding non-DRM alternative audio stream...")
-                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch2:{fallback_query}")
+                    except Exception:
+                        pass
                 else:
-                    logger.info(f"Primary stream blocked ({url}). Redirecting download to SoundCloud for: {fallback_query}")
-                    await status_msg.edit_text("⚠️ Primary stream unavailable. Redirecting to SoundCloud...")
+                    logger.info(f"Primary blocked ({url}). Trying SoundCloud for: {fallback_query}")
+                    await status_msg.edit_text("⚠️ Trying SoundCloud alternative...")
                     try:
                         info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
-                    except Exception as e2:
-                        logger.warning(f"scsearch1 failed: {e2}. Trying YouTube alternative...")
-                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
+                    except Exception:
+                        pass
 
-                if info and info.get("entries"):
-                    info = next((item for item in info["entries"] if item is not None), None)
-                if not info:
-                    raise e
-            else:
+            # Attempt 4: If SoundCloud also failed (DRM), try Piped with a YouTube search
+            if not info and fallback_query and not yt_video_id:
+                await status_msg.edit_text("⚠️ Searching YouTube via Piped proxy...")
+                try:
+                    search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+                    def _yt_search():
+                        with yt_dlp.YoutubeDL(search_opts) as ydl:
+                            return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
+                    search_res = await asyncio.get_event_loop().run_in_executor(None, _yt_search)
+                    if search_res and search_res.get("entries"):
+                        found_id = search_res["entries"][0].get("id")
+                        if found_id:
+                            info = await download_via_piped(found_id, timestamp)
+                except Exception:
+                    pass
+
+            if info and info.get("entries"):
+                info = next((item for item in info["entries"] if item is not None), None)
+
+            if not info:
                 raise e
 
         video_id = info.get("id")
