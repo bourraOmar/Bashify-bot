@@ -415,12 +415,33 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         try:
             info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
         except Exception as e:
-            if fallback_query and "youtube.com" in str(url):
-                logger.info(f"YouTube blocked {url}. Auto-redirecting download to SoundCloud for: {fallback_query}")
-                await status_msg.edit_text("⚠️ YouTube anti-bot block detected. Redirecting to SoundCloud...")
-                info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
+            err_str = str(e).lower()
+            if not fallback_query and message.text and not message.text.strip().startswith("http"):
+                fallback_query = message.text.strip()
+
+            if fallback_query:
+                if "soundcloud" in str(url) or "drm" in err_str:
+                    logger.info(f"SoundCloud track blocked/DRM ({url}). Redirecting to YouTube for: {fallback_query}")
+                    await status_msg.edit_text("⚠️ SoundCloud DRM protection detected. Switching to YouTube Music stream...")
+                    try:
+                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
+                    except Exception as e2:
+                        logger.warning(f"ytsearch1 failed: {e2}. Trying scsearch2 (non-DRM reupload)...")
+                        await status_msg.edit_text("⚠️ Finding non-DRM alternative audio stream...")
+                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch2:{fallback_query}")
+                else:
+                    logger.info(f"Primary stream blocked ({url}). Redirecting download to SoundCloud for: {fallback_query}")
+                    await status_msg.edit_text("⚠️ Primary stream unavailable. Redirecting to SoundCloud...")
+                    try:
+                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
+                    except Exception as e2:
+                        logger.warning(f"scsearch1 failed: {e2}. Trying YouTube alternative...")
+                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
+
                 if info and info.get("entries"):
-                    info = info["entries"][0]
+                    info = next((item for item in info["entries"] if item is not None), None)
+                if not info:
+                    raise e
             else:
                 raise e
 
