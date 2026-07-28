@@ -86,9 +86,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def setup_youtube_cookies():
-    """Load YouTube cookies from YOUTUBE_COOKIES_URL or split environment variables."""
+    """Load YouTube cookies from YOUTUBE_COOKIES_URL or split environment variables with validation."""
     cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
-    if os.path.isfile(cookies_file):
+    if os.path.isfile(cookies_file) and os.path.getsize(cookies_file) > 0:
         return
 
     # Option 1: Download from a private Gist URL or Paste URL if provided
@@ -96,9 +96,22 @@ def setup_youtube_cookies():
     if cookies_url:
         try:
             import urllib.request
+            # Auto-convert standard GitHub Gist link to its raw plain-text URL
+            if "gist.github.com" in cookies_url and "/raw" not in cookies_url:
+                cookies_url = cookies_url.rstrip("/") + "/raw"
+                
             logger.info(f"Downloading YouTube cookies from {cookies_url}...")
             urllib.request.urlretrieve(cookies_url, cookies_file)
-            logger.info("Successfully loaded cookies from YOUTUBE_COOKIES_URL into cookies.txt")
+            
+            # Validate that the downloaded file is plain text cookies, NOT an HTML webpage
+            with open(cookies_file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(500).strip()
+                if content.startswith("<") or ("<!DOCTYPE" in content) or ("<html" in content):
+                    logger.error("Downloaded cookies.txt appears to be an HTML webpage! Removing invalid cookie file.")
+                    os.remove(cookies_file)
+                    return
+
+            logger.info("Successfully loaded valid cookies from YOUTUBE_COOKIES_URL into cookies.txt")
             return
         except Exception as e:
             logger.error(f"Failed to download cookies from URL: {e}")
@@ -125,7 +138,7 @@ def setup_youtube_cookies():
 setup_youtube_cookies()
 
 
-def get_ydl_opts(custom_opts=None, player_clients=None):
+def get_ydl_opts(custom_opts=None, player_clients=None, include_cookies=True):
     """Returns yt-dlp options configured to bypass YouTube bot detection on cloud servers."""
     if not player_clients:
         player_clients = ["tv_embedded", "web_embedded", "ios", "mweb", "tv", "music"]
@@ -133,7 +146,6 @@ def get_ydl_opts(custom_opts=None, player_clients=None):
     opts = {
         "quiet": True,
         "no_warnings": True,
-        # Bypass 'Sign in to confirm you're not a bot' on cloud datacenter IPs (Back4App, AWS, etc.)
         "extractor_args": {
             "youtube": {
                 "player_client": player_clients,
@@ -142,7 +154,7 @@ def get_ydl_opts(custom_opts=None, player_clients=None):
     }
     
     cookies_file = os.path.join(SCRIPT_DIR, "cookies.txt")
-    if os.path.isfile(cookies_file):
+    if include_cookies and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
         
     if custom_opts:
@@ -151,25 +163,31 @@ def get_ydl_opts(custom_opts=None, player_clients=None):
 
 
 async def search_music(query: str, count: int = TOTAL_RESULTS):
-    """Search for music using YouTube first (leveraging secret Gist cookies), falling back to SoundCloud."""
-    ydl_opts = get_ydl_opts({
-        "extract_flat": "in_playlist",
-    })
-
+    """Search for music using YouTube first (with secret Gist cookies), falling back to clean SoundCloud search."""
     def _search():
-        # 1. Try YouTube first (unrestricted artist catalog with zero SoundCloud DRM when cookies are active)
+        # 1. Try YouTube search first (uses Gist cookies if available)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            yt_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+            with yt_dlp.YoutubeDL(yt_opts) as ydl:
                 res = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
                 if res and res.get("entries"):
                     logger.info(f"YouTube search returned {len(res['entries'])} results.")
                     return res
         except Exception as e:
-            logger.warning(f"YouTube search errored, switching to SoundCloud: {e}")
+            logger.warning(f"YouTube search errored or blocked ({e}), switching to SoundCloud...")
 
-        # 2. Fallback to SoundCloud search if YouTube is unreachable
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(f"scsearch{count}:{query}", download=False)
+        # 2. Fallback to clean SoundCloud search without YouTube cookie/extractor parameters
+        try:
+            sc_opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}
+            with yt_dlp.YoutubeDL(sc_opts) as ydl:
+                res = ydl.extract_info(f"scsearch{count}:{query}", download=False)
+                if res and res.get("entries"):
+                    logger.info(f"SoundCloud search returned {len(res['entries'])} results.")
+                    return res
+        except Exception as e2:
+            logger.error(f"SoundCloud search failed as well: {e2}")
+            
+        return {"entries": []}
 
     return await asyncio.get_event_loop().run_in_executor(None, _search)
 
