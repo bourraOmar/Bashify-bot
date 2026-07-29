@@ -453,6 +453,11 @@ async def download_via_piped(video_id: str, timestamp: int) -> dict:
         "https://pipedapi.kavin.rocks",
         "https://pipedapi.adminforge.de",
         "https://api.piped.projectsegfau.lt",
+        "https://pipedapi.in.projectsegfau.lt",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.r4fo.com",
+        "https://pipedapi.ngn.tf",
+        "https://pipedapi.darkness.services",
     ]
 
     for api_base in piped_instances:
@@ -556,25 +561,34 @@ async def download_and_send(message, url: str, fallback_query: str = None):
     try:
         info = None
 
-        # Attempt 1: Direct yt-dlp download
-        try:
-            info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
-        except Exception as e:
-            err_str = str(e).lower()
-            if not fallback_query and message.text and not message.text.strip().startswith("http"):
-                fallback_query = message.text.strip()
+        # Extract YouTube video ID if applicable
+        yt_video_id = None
+        yt_match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", str(url))
+        if yt_match:
+            yt_video_id = yt_match.group(1)
 
-            # Extract YouTube video ID for Piped fallback
-            yt_video_id = None
-            yt_match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", str(url))
-            if yt_match:
-                yt_video_id = yt_match.group(1)
+        # For YouTube URLs: try Piped API FIRST (datacenter IPs are always blocked by YouTube)
+        if yt_video_id:
+            logger.info(f"YouTube video detected ({yt_video_id}). Trying Piped API first...")
+            await status_msg.edit_text("🔄 Fetching audio stream...")
+            info = await download_via_piped(yt_video_id, timestamp)
 
-            # Attempt 2: If YouTube bot-blocked, try Piped API proxy
-            if yt_video_id and ("sign in" in err_str or "bot" in err_str or "confirm" in err_str):
-                logger.info(f"YouTube blocked {url}. Trying Piped API for video {yt_video_id}...")
-                await status_msg.edit_text("⚠️ YouTube bot block detected. Trying alternative stream...")
-                info = await download_via_piped(yt_video_id, timestamp)
+            # If Piped failed, try direct yt-dlp (works if POT server is running or cookies are valid)
+            if not info:
+                logger.info(f"Piped failed for {yt_video_id}. Trying direct yt-dlp with POT/cookies...")
+                await status_msg.edit_text("🔄 Trying direct YouTube download...")
+                try:
+                    info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
+                except Exception as e:
+                    logger.warning(f"Direct yt-dlp also failed: {e}")
+        else:
+            # Non-YouTube URL (SoundCloud, etc.): use yt-dlp directly
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
+            except Exception as e:
+                err_str = str(e).lower()
+                if not fallback_query and message.text and not message.text.strip().startswith("http"):
+                    fallback_query = message.text.strip()
 
             # Attempt 3: SoundCloud / cross-platform fallback
             if not info and fallback_query:
