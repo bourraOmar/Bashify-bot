@@ -560,6 +560,7 @@ async def download_and_send(message, url: str, fallback_query: str = None):
 
     try:
         info = None
+        last_error = "Could not download stream."
 
         # Extract YouTube video ID if applicable
         yt_video_id = None
@@ -567,67 +568,71 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         if yt_match:
             yt_video_id = yt_match.group(1)
 
-        # For YouTube URLs: try Piped API FIRST (datacenter IPs are always blocked by YouTube)
+        # Attempt 1: For YouTube URLs, try Piped API FIRST (datacenter IPs are always blocked by YouTube)
         if yt_video_id:
             logger.info(f"YouTube video detected ({yt_video_id}). Trying Piped API first...")
             await status_msg.edit_text("🔄 Fetching audio stream...")
             info = await download_via_piped(yt_video_id, timestamp)
 
-            # If Piped failed, try direct yt-dlp (works if POT server is running or cookies are valid)
-            if not info:
-                logger.info(f"Piped failed for {yt_video_id}. Trying direct yt-dlp with POT/cookies...")
-                await status_msg.edit_text("🔄 Trying direct YouTube download...")
-                try:
-                    info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
-                except Exception as e:
-                    logger.warning(f"Direct yt-dlp also failed: {e}")
-        else:
-            # Non-YouTube URL (SoundCloud, etc.): use yt-dlp directly
+        # Attempt 2: Direct yt-dlp download (for SoundCloud URLs or if Piped failed)
+        if not info:
+            logger.info(f"Trying direct yt-dlp download for {url}...")
+            if yt_video_id:
+                await status_msg.edit_text("🔄 Trying direct YouTube stream...")
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
             except Exception as e:
-                err_str = str(e).lower()
-                if not fallback_query and message.text and not message.text.strip().startswith("http"):
-                    fallback_query = message.text.strip()
+                last_error = str(e)
+                logger.warning(f"Direct yt-dlp download failed for {url}: {e}")
 
-            # Attempt 3: SoundCloud / cross-platform fallback
-            if not info and fallback_query:
-                if "soundcloud" in str(url) or "drm" in err_str:
-                    logger.info(f"SoundCloud DRM ({url}). Trying YouTube for: {fallback_query}")
-                    await status_msg.edit_text("⚠️ SoundCloud DRM detected. Trying YouTube...")
-                    try:
-                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
-                    except Exception:
-                        pass
-                else:
-                    logger.info(f"Primary blocked ({url}). Trying SoundCloud for: {fallback_query}")
-                    await status_msg.edit_text("⚠️ Trying SoundCloud alternative...")
+        # Attempt 3: Cross-platform fallback (If YouTube fails -> try SoundCloud! If SoundCloud fails -> try YouTube!)
+        if not info:
+            if not fallback_query and message.text and not message.text.strip().startswith("http"):
+                fallback_query = message.text.strip()
+
+            if fallback_query:
+                if yt_video_id or "youtube" in str(url):
+                    # YouTube failed, automatically switch to SoundCloud (which works perfectly on cloud servers)
+                    logger.info(f"YouTube blocked. Switching to SoundCloud for: {fallback_query}")
+                    await status_msg.edit_text("⚡ YouTube server restricted. Switching to SoundCloud audio...")
                     try:
                         info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"scsearch1 failed: {e}")
+                        # Try a simpler search query if the full title+artist failed
+                        clean_query = fallback_query.split("-")[0].strip() if "-" in fallback_query else fallback_query[:30]
+                        try:
+                            info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{clean_query}")
+                        except Exception as e2:
+                            last_error = f"SoundCloud search failed: {e2}"
+                else:
+                    # SoundCloud failed (e.g. DRM protection), try YouTube via Piped proxy search
+                    logger.info(f"SoundCloud failed. Trying YouTube search for: {fallback_query}")
+                    await status_msg.edit_text("⚡ Switching to YouTube stream...")
+                    try:
+                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
+                    except Exception as e:
+                        logger.warning(f"ytsearch1 failed: {e}. Trying Piped search...")
+                        try:
+                            search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+                            def _yt_search():
+                                with yt_dlp.YoutubeDL(search_opts) as ydl:
+                                    return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
+                            search_res = await asyncio.get_event_loop().run_in_executor(None, _yt_search)
+                            if search_res and search_res.get("entries"):
+                                found_id = search_res["entries"][0].get("id")
+                                if found_id:
+                                    info = await download_via_piped(found_id, timestamp)
+                        except Exception as e2:
+                            last_error = f"YouTube fallback failed: {e2}"
 
-            # Attempt 4: If SoundCloud also failed (DRM), try Piped with a YouTube search
-            if not info and fallback_query and not yt_video_id:
-                await status_msg.edit_text("⚠️ Searching YouTube via Piped proxy...")
-                try:
-                    search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
-                    def _yt_search():
-                        with yt_dlp.YoutubeDL(search_opts) as ydl:
-                            return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
-                    search_res = await asyncio.get_event_loop().run_in_executor(None, _yt_search)
-                    if search_res and search_res.get("entries"):
-                        found_id = search_res["entries"][0].get("id")
-                        if found_id:
-                            info = await download_via_piped(found_id, timestamp)
-                except Exception:
-                    pass
+        # Unpack playlist / search entry if needed
+        if info and isinstance(info, dict) and info.get("entries"):
+            info = next((item for item in info["entries"] if item is not None), None)
 
-            if info and info.get("entries"):
-                info = next((item for item in info["entries"] if item is not None), None)
-
-            if not info:
-                raise e
+        # Final check: Ensure we actually obtained track info before extracting attributes
+        if not info or not isinstance(info, dict):
+            raise Exception(f"Stream unavailable: {last_error}")
 
         video_id = info.get("id")
         title = info.get("title", "Audio Track")
