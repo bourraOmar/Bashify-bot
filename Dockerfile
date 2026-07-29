@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
 # Copy bot code and entrypoint
 COPY bot.py .
 COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # Expose port for cloud health monitoring (Back4App / Render)
 ENV PORT=7860
