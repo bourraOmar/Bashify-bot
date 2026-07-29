@@ -167,14 +167,27 @@ def get_cookies_status():
         return f"❌ Error reading cookies.txt: {e}"
 
 
+def check_pot_server():
+    """Check if the PO Token provider HTTP server is running."""
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:4416/", method="GET")
+        with urllib.request.urlopen(req, timeout=2):
+            return True
+    except Exception:
+        return False
+
+
 setup_youtube_cookies()
 logger.info(f"Cookie status: {get_cookies_status()}")
+logger.info(f"POT server: {'✅ Running on port 4416' if check_pot_server() else '❌ Not detected'}")
 
 
 def get_ydl_opts(custom_opts=None, player_clients=None, include_cookies=True):
     """Returns yt-dlp options configured to bypass YouTube bot detection on cloud servers."""
     if not player_clients:
-        player_clients = ["tv_embedded", "web_embedded", "ios", "mweb", "tv", "music"]
+        # 2026-optimized: 'default' and 'web' work best with POT tokens on datacenter IPs
+        player_clients = ["default", "web", "mweb", "tv_embedded"]
 
     opts = {
         "quiet": True,
@@ -712,6 +725,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cookie_status = get_cookies_status()
+    pot_status = "✅ Running on port 4416" if check_pot_server() else "❌ Not detected"
     try:
         ytdlp_version = yt_dlp.version.__version__
     except Exception:
@@ -720,6 +734,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = (
         "🔧 <b>Bot Status</b>\n\n"
         f"🍪 <b>Cookies:</b> {cookie_status}\n"
+        f"🔑 <b>POT Server:</b> {pot_status}\n"
         f"📦 <b>yt-dlp:</b> {ytdlp_version}\n"
         f"🎬 <b>FFmpeg:</b> {FFMPEG_EXE}\n"
         f"📂 <b>Downloads dir:</b> {DOWNLOAD_DIR}\n"
@@ -741,6 +756,7 @@ def main():
     print(f"[DIR]   Downloads: {DOWNLOAD_DIR}")
     print(f"[FFMPEG] {FFMPEG_EXE}")
     print(f"[COOKIE] {get_cookies_status()}")
+    print(f"[POT]   {'✅ Running on port 4416' if check_pot_server() else '❌ Not detected'}")
     print(f"[HTTP]  Listening on port {port} (for cloud health monitoring)")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
