@@ -324,17 +324,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Spotify URL conversion
-    if re.match(r"https?://(open\.)?spotify\.com/\S+", text):
-        status_msg = await update.message.reply_text("🎵 Converting Spotify link to SoundCloud...")
-        query = await parse_spotify_url(text)
-        if not query:
-            await status_msg.edit_text("Could not read Spotify link. Please type the song name directly.")
-            return
-        await status_msg.edit_text(f"Searching SoundCloud for: <code>{html.escape(query)}</code>...", parse_mode="HTML")
-        text = query
-    elif re.match(r"https?://\S+", text):
-        # Direct URL (YouTube, SoundCloud, etc.)
+    # Direct URL (YouTube, SoundCloud, Spotify, etc.)
+    if re.match(r"https?://\S+", text):
         await download_and_send(update.message, text)
         return
     else:
@@ -598,6 +589,54 @@ async def download_via_socialkit(url: str, video_id: str, timestamp: int) -> dic
     return None
 
 
+async def download_via_spotdl(query_or_url: str, timestamp: int) -> dict:
+    """Download audio with spotDL (free, embeds ID3 lyrics and artwork from Spotify)."""
+    import shutil
+    spotdl_exe = shutil.which("spotdl") or "spotdl"
+
+    out_tmpl = os.path.join(DOWNLOAD_DIR, f"spotdl_{timestamp}_{{track-id}}.{{output-ext}}")
+    cmd = [
+        spotdl_exe,
+        query_or_url,
+        "--format", "mp3",
+        "--output", out_tmpl,
+        "--ffmpeg", FFMPEG_EXE,
+        "--overwrite", "force",
+    ]
+    logger.info(f"Running spotdl: {' '.join(cmd)}")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.warning(f"spotdl failed: {stderr.decode(errors='ignore')}")
+            return None
+
+        downloaded = glob.glob(os.path.join(DOWNLOAD_DIR, f"spotdl_{timestamp}_*.mp3"))
+        if not downloaded:
+            logger.warning("spotdl finished with returncode 0 but no output file found.")
+            return None
+
+        file_path = downloaded[0]
+        filename = os.path.basename(file_path)
+        track_id = filename.split(".")[0]
+
+        return {
+            "id": track_id,
+            "title": query_or_url if not query_or_url.startswith("http") else "Spotify Track",
+            "uploader": "Spotify / spotDL",
+            "duration": 0,
+            "source": "spotdl",
+            "pre_converted_mp3": file_path,
+        }
+    except Exception as e:
+        logger.error(f"spotdl execution error: {e}")
+        return None
+
+
 async def download_and_send(message, url: str, fallback_query: str = None):
     """Download audio with yt-dlp, convert with ffmpeg, send to Telegram."""
     status_msg = await message.reply_text("Downloading audio...")
@@ -633,20 +672,26 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         info = None
         last_error = "Could not download stream."
 
+        # Attempt 1: For Spotify URLs, use spotDL directly
+        if "spotify.com" in str(url):
+            logger.info(f"Spotify link detected ({url}). Using spotDL...")
+            await status_msg.edit_text("🎵 Downloading Spotify track with spotDL...")
+            info = await download_via_spotdl(url, timestamp)
+
         # Extract YouTube video ID if applicable
         yt_video_id = None
         yt_match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", str(url))
         if yt_match:
             yt_video_id = yt_match.group(1)
 
-        # Attempt 1: For YouTube URLs, try Piped API FIRST (datacenter IPs are always blocked by YouTube)
-        if yt_video_id:
+        # Attempt 2: For YouTube URLs, try Piped API FIRST (datacenter IPs are always blocked by YouTube)
+        if not info and yt_video_id:
             logger.info(f"YouTube video detected ({yt_video_id}). Trying Piped API first...")
             await status_msg.edit_text("🔄 Fetching audio stream...")
             info = await download_via_piped(yt_video_id, timestamp)
 
-        # Attempt 2: Direct yt-dlp download (for SoundCloud URLs or if Piped failed)
-        if not info:
+        # Attempt 3: Direct yt-dlp download (for SoundCloud URLs or if Piped failed)
+        if not info and "spotify.com" not in str(url):
             logger.info(f"Trying direct yt-dlp download for {url}...")
             if yt_video_id:
                 await status_msg.edit_text("🔄 Trying direct YouTube stream...")
@@ -656,34 +701,37 @@ async def download_and_send(message, url: str, fallback_query: str = None):
                 last_error = str(e)
                 logger.warning(f"Direct yt-dlp download failed for {url}: {e}")
 
-        # Attempt 3: Try SocialKit API (if configured in .env and free methods failed)
+        # Attempt 4: Try spotDL free fallback before consuming paid API credits!
+        if not info and fallback_query:
+            logger.info(f"Primary methods failed. Trying spotDL fallback for: {fallback_query}...")
+            await status_msg.edit_text("⚡ Switching to spotDL audio downloader...")
+            info = await download_via_spotdl(fallback_query, timestamp)
+
+        # Attempt 5: Try SocialKit API (if configured in .env and free methods failed)
         if not info and yt_video_id and SOCIALKIT_ACCESS_KEY:
             logger.info(f"Free methods failed. Trying SocialKit API for {url}...")
             await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
             info = await download_via_socialkit(url, yt_video_id, timestamp)
 
-        # Attempt 4: Cross-platform fallback (If YouTube fails -> try SoundCloud! If SoundCloud fails -> try YouTube!)
+        # Attempt 6: Cross-platform fallback (SoundCloud / YouTube search)
         if not info:
             if not fallback_query and message.text and not message.text.strip().startswith("http"):
                 fallback_query = message.text.strip()
 
             if fallback_query:
-                if yt_video_id or "youtube" in str(url):
-                    # YouTube failed, automatically switch to SoundCloud (which works perfectly on cloud servers)
-                    logger.info(f"YouTube blocked. Switching to SoundCloud for: {fallback_query}")
-                    await status_msg.edit_text("⚡ YouTube server restricted. Switching to SoundCloud audio...")
+                if yt_video_id or "youtube" in str(url) or "spotify" in str(url):
+                    logger.info(f"Primary sources restricted. Switching to SoundCloud for: {fallback_query}")
+                    await status_msg.edit_text("⚡ Switching to SoundCloud alternative audio...")
                     try:
                         info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
                     except Exception as e:
                         logger.warning(f"scsearch1 failed: {e}")
-                        # Try a simpler search query if the full title+artist failed
                         clean_query = fallback_query.split("-")[0].strip() if "-" in fallback_query else fallback_query[:30]
                         try:
                             info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{clean_query}")
                         except Exception as e2:
                             last_error = f"SoundCloud search failed: {e2}"
                 else:
-                    # SoundCloud failed (e.g. DRM protection), try YouTube via Piped proxy search
                     logger.info(f"SoundCloud failed. Trying YouTube search for: {fallback_query}")
                     await status_msg.edit_text("⚡ Switching to YouTube stream...")
                     try:
@@ -716,35 +764,39 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         artist = info.get("artist") or info.get("uploader") or "Unknown Artist"
         duration = int(info.get("duration") or 0)
 
-        # Find downloaded raw audio file
-        raw_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"*{video_id}_{timestamp}.*"))
-        audio_extensions = ('.webm', '.m4a', '.opus', '.ogg', '.mp4', '.mp3', '.aac', '.wav', '.flac')
-        raw_audio = [f for f in raw_files if os.path.splitext(f)[1].lower() in audio_extensions]
-
-        if not raw_audio:
-            await status_msg.edit_text("Download failed - no audio file found.")
-            return
-
-        raw_path = raw_audio[0]
         mp3_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_{timestamp}.mp3")
 
-        # Step 2: Convert to MP3 with ffmpeg
-        await status_msg.edit_text("Converting to MP3...")
+        # Check if file is already a pre-converted MP3 from spotDL
+        if info.get("pre_converted_mp3") and os.path.isfile(info["pre_converted_mp3"]):
+            mp3_path = info["pre_converted_mp3"]
+            logger.info(f"Using pre-converted MP3 from spotDL: {mp3_path}")
+        else:
+            # Find downloaded raw audio file
+            raw_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"*{video_id}_{timestamp}.*"))
+            audio_extensions = ('.webm', '.m4a', '.opus', '.ogg', '.mp4', '.mp3', '.aac', '.wav', '.flac')
+            raw_audio = [f for f in raw_files if os.path.splitext(f)[1].lower() in audio_extensions]
 
-        def _convert():
-            cmd = [
-                FFMPEG_EXE, "-i", raw_path,
-                "-vn", "-ab", "192k", "-ar", "44100", "-y",
-                mp3_path
-            ]
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if not raw_audio:
+                await status_msg.edit_text("Download failed - no audio file found.")
+                return
 
-        convert_result = await asyncio.get_event_loop().run_in_executor(None, _convert)
+            raw_path = raw_audio[0]
+            await status_msg.edit_text("Converting to MP3...")
 
-        if convert_result.returncode != 0 or not os.path.isfile(mp3_path):
-            logger.error(f"FFmpeg error: {convert_result.stderr[:500]}")
-            await status_msg.edit_text("MP3 conversion failed.")
-            return
+            def _convert():
+                cmd = [
+                    FFMPEG_EXE, "-i", raw_path,
+                    "-vn", "-ab", "192k", "-ar", "44100", "-y",
+                    mp3_path
+                ]
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+            convert_result = await asyncio.get_event_loop().run_in_executor(None, _convert)
+
+            if convert_result.returncode != 0 or not os.path.isfile(mp3_path):
+                logger.error(f"FFmpeg error: {convert_result.stderr[:500]}")
+                await status_msg.edit_text("MP3 conversion failed.")
+                return
 
         # Find thumbnail
         thumb_path = None
