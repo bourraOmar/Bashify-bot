@@ -51,6 +51,7 @@ from telegram.ext import (
 
 # Config
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SOCIALKIT_API_KEY = os.getenv("SOCIALKIT_API_KEY")
 ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
 DOWNLOAD_DIR = os.path.join(SCRIPT_DIR, "downloads")
 RESULTS_PER_PAGE = 10
@@ -444,6 +445,78 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def download_via_socialkit(url: str, timestamp: int) -> dict:
+    """Download YouTube audio/video via SocialKit API (cloud extraction API)."""
+    import urllib.request
+    import urllib.parse
+    import json
+
+    if not SOCIALKIT_API_KEY:
+        return None
+
+    try:
+        logger.info(f"SocialKit: Requesting audio download for {url}...")
+        params = urllib.parse.urlencode({
+            "access_key": SOCIALKIT_API_KEY,
+            "url": url,
+            "format": "mp3"
+        })
+        api_url = f"https://api.socialkit.dev/youtube/download?{params}"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e_get:
+            logger.warning(f"SocialKit GET failed ({e_get}), trying POST...")
+            post_url = "https://api.socialkit.dev/youtube/download"
+            post_data = json.dumps({"access_key": SOCIALKIT_API_KEY, "url": url, "format": "mp3"}).encode("utf-8")
+            post_req = urllib.request.Request(post_url, data=post_data, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(post_req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+        result = data.get("data", data)
+        download_url = result.get("url") or result.get("download_url") or result.get("link") or result.get("audio_url")
+        if not download_url and isinstance(result, list) and len(result) > 0:
+            download_url = result[0].get("url") or result[0].get("download_url")
+
+        if not download_url:
+            logger.warning(f"SocialKit did not return a valid download link: {str(data)[:200]}")
+            return None
+
+        title = result.get("title", "Audio Track")
+        uploader = result.get("channel") or result.get("author") or result.get("uploader", "Unknown Artist")
+        duration = int(result.get("duration", 0))
+
+        yt_match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", str(url))
+        video_id = yt_match.group(1) if yt_match else "socialkit_track"
+
+        ext = "mp3" if "mp3" in str(download_url).lower() else "m4a"
+        out_path = os.path.join(DOWNLOAD_DIR, f"{video_id}_{timestamp}.{ext}")
+
+        logger.info(f"SocialKit: downloading file from {download_url[:60]}...")
+        dl_req = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(dl_req, timeout=60) as stream_resp:
+            with open(out_path, "wb") as f:
+                while True:
+                    chunk = stream_resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 10000:
+            return {
+                "id": video_id,
+                "title": title,
+                "uploader": uploader,
+                "duration": duration,
+                "source": "socialkit",
+            }
+    except Exception as e:
+        logger.error(f"SocialKit download exception: {e}")
+    return None
+
+
 async def download_via_piped(video_id: str, timestamp: int) -> dict:
     """Download YouTube audio via Piped API instances (bypasses YouTube datacenter IP blocking)."""
     import urllib.request
@@ -574,7 +647,13 @@ async def download_and_send(message, url: str, fallback_query: str = None):
             await status_msg.edit_text("🔄 Fetching audio stream...")
             info = await download_via_piped(yt_video_id, timestamp)
 
-        # Attempt 2: Direct yt-dlp download (for SoundCloud URLs or if Piped failed)
+            # Attempt 1.5: Try SocialKit API if configured and Piped failed!
+            if not info and SOCIALKIT_API_KEY:
+                logger.info(f"Piped failed for {yt_video_id}. Trying SocialKit API...")
+                await status_msg.edit_text("⚡ Fetching stream via SocialKit API...")
+                info = await download_via_socialkit(url, timestamp)
+
+        # Attempt 2: Direct yt-dlp download (for SoundCloud URLs or if Piped & SocialKit failed)
         if not info:
             logger.info(f"Trying direct yt-dlp download for {url}...")
             if yt_video_id:
@@ -745,6 +824,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cookie_status = get_cookies_status()
     pot_status = "✅ Running on port 4416" if check_pot_server() else "❌ Not detected"
+    sk_status = "✅ Active (Key Loaded)" if SOCIALKIT_API_KEY else "❌ Not configured"
     try:
         ytdlp_version = yt_dlp.version.__version__
     except Exception:
@@ -754,6 +834,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔧 <b>Bot Status</b>\n\n"
         f"🍪 <b>Cookies:</b> {cookie_status}\n"
         f"🔑 <b>POT Server:</b> {pot_status}\n"
+        f"⚡ <b>SocialKit API:</b> {sk_status}\n"
         f"📦 <b>yt-dlp:</b> {ytdlp_version}\n"
         f"🎬 <b>FFmpeg:</b> {FFMPEG_EXE}\n"
         f"📂 <b>Downloads dir:</b> {DOWNLOAD_DIR}\n"
@@ -776,6 +857,7 @@ def main():
     print(f"[FFMPEG] {FFMPEG_EXE}")
     print(f"[COOKIE] {get_cookies_status()}")
     print(f"[POT]   {'✅ Running on port 4416' if check_pot_server() else '❌ Not detected'}")
+    print(f"[SK_API] {'✅ Active' if SOCIALKIT_API_KEY else '❌ Not set'}")
     print(f"[HTTP]  Listening on port {port} (for cloud health monitoring)")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
