@@ -481,19 +481,14 @@ async def download_via_piped(video_id: str, timestamp: int) -> dict:
     piped_instances = [
         "https://pipedapi.kavin.rocks",
         "https://pipedapi.adminforge.de",
-        "https://api.piped.projectsegfau.lt",
-        "https://pipedapi.in.projectsegfau.lt",
-        "https://pipedapi.leptons.xyz",
         "https://pipedapi.r4fo.com",
-        "https://pipedapi.ngn.tf",
-        "https://pipedapi.darkness.services",
     ]
 
     for api_base in piped_instances:
         try:
             api_url = f"{api_base}/streams/{video_id}"
             req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             title = data.get("title", "Audio Track")
@@ -644,9 +639,14 @@ async def download_via_spotdl(query_or_url: str, timestamp: int) -> dict:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            process.kill()
+            logger.warning("spotdl timed out after 60s")
+            return None
         if process.returncode != 0:
-            logger.warning(f"spotdl failed: {stderr.decode(errors='ignore')}")
+            logger.warning(f"spotdl failed: {stderr.decode(errors='ignore')[:300]}")
             return None
 
         downloaded = glob.glob(os.path.join(DOWNLOAD_DIR, f"spotdl_{timestamp}_*.mp3"))
@@ -694,14 +694,11 @@ async def download_and_send(message, url: str, fallback_query: str = None):
 
     timestamp = int(asyncio.get_event_loop().time())
 
-    # Step 1: Download raw audio with fallback client strategies
+    # Step 1: Download raw audio with fast client strategies (reduced retries for speed)
     def _download(target_url):
         strategies = [
-            ["tv_embedded", "web_embedded"],
-            ["tv", "music"],
-            ["ios", "mweb"],
-            ["android", "android_vr"],
-            ["web_creator", "web"],
+            ["default", "web", "mweb"],
+            ["tv_embedded", "web_embedded", "ios"],
         ]
         last_exception = None
         for strategy in strategies:
@@ -709,6 +706,7 @@ async def download_and_send(message, url: str, fallback_query: str = None):
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(DOWNLOAD_DIR, f"%(id)s_{timestamp}.%(ext)s"),
                 "writethumbnail": True,
+                "socket_timeout": 15,
             }, player_clients=strategy)
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -736,56 +734,77 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         if yt_match:
             yt_video_id = yt_match.group(1)
 
-        # Attempt 1: For Spotify URLs or text queries, try spotDL first
-        if "spotify.com" in str(url) or fallback_query:
-            target = url if "spotify.com" in str(url) else fallback_query
-            logger.info(f"Trying spotDL for: {target}")
-            await status_msg.edit_text("🎵 Downloading high-quality audio with spotDL...")
-            info = await download_via_spotdl(target, timestamp)
+        # ===== SPEED-OPTIMIZED PARALLEL DOWNLOAD PIPELINE =====
+        # Run spotDL + YouTube ID search IN PARALLEL to save 10-20 seconds!
 
-        # Step 2: If spotDL failed or it's not a Spotify link, secure a YouTube Video ID for exact title matching!
-        if not info and not yt_video_id and fallback_query:
-            logger.info(f"spotDL missed or restricted. Finding exact YouTube ID for: {fallback_query}")
+        async def _find_youtube_id(query):
+            """Find YouTube video ID for a text query (runs in background)."""
             try:
-                search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+                search_opts = get_ydl_opts({"extract_flat": "in_playlist", "socket_timeout": 10}, include_cookies=True)
                 def _yt_find():
                     with yt_dlp.YoutubeDL(search_opts) as ydl:
-                        return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
+                        return ydl.extract_info(f"ytsearch1:{query}", download=False)
                 s_res = await asyncio.get_event_loop().run_in_executor(None, _yt_find)
                 if s_res and s_res.get("entries") and s_res["entries"][0] is not None:
-                    yt_video_id = s_res["entries"][0].get("id")
-                    logger.info(f"Found exact YouTube video match: {yt_video_id}")
+                    return s_res["entries"][0].get("id")
             except Exception as e:
-                logger.warning(f"Could not find YouTube ID for query: {e}")
+                logger.warning(f"YouTube ID search failed: {e}")
+            return None
 
-        # Attempt 2: Try Piped Proxy API (free cloud proxy for YouTube audio)
-        if not info and yt_video_id:
-            logger.info(f"YouTube video ID ({yt_video_id}) ready. Trying Piped API...")
-            await status_msg.edit_text("🔄 Fetching YouTube audio via Piped proxy...")
-            info = await download_via_piped(yt_video_id, timestamp)
+        # Attempt 1: spotDL + YouTube ID search run simultaneously!
+        if "spotify.com" in str(url) or fallback_query:
+            target = url if "spotify.com" in str(url) else fallback_query
+            logger.info(f"Trying spotDL + YouTube ID search in parallel for: {target}")
+            await status_msg.edit_text("🎵 Downloading audio...")
 
-        # Attempt 3: Direct yt-dlp download (works perfectly when running locally on your PC!)
+            # Launch both tasks at the same time
+            tasks = [download_via_spotdl(target, timestamp)]
+            if not yt_video_id and fallback_query:
+                tasks.append(_find_youtube_id(fallback_query))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process spotDL result
+            spotdl_result = results[0]
+            if isinstance(spotdl_result, dict) and spotdl_result:
+                info = spotdl_result
+                logger.info("spotDL succeeded!")
+            else:
+                logger.info(f"spotDL missed, checking YouTube ID from parallel search...")
+
+            # Process YouTube ID result (if we searched)
+            if len(results) > 1 and not isinstance(results[1], Exception) and results[1]:
+                yt_video_id = results[1]
+                logger.info(f"YouTube ID found in parallel: {yt_video_id}")
+
+        # Attempt 2: Direct yt-dlp download (fastest for local PC with residential IP!)
         if not info:
             target_url = f"https://www.youtube.com/watch?v={yt_video_id}" if yt_video_id else url
             if "spotify.com" not in str(target_url):
-                logger.info(f"Trying direct yt-dlp stream for {target_url}...")
-                await status_msg.edit_text("🔄 Downloading audio stream directly...")
+                logger.info(f"Direct yt-dlp stream for {target_url}...")
+                await status_msg.edit_text("🔄 Downloading audio stream...")
                 try:
                     info = await asyncio.get_event_loop().run_in_executor(None, _download, target_url)
                 except Exception as e:
                     last_error = str(e)
                     logger.warning(f"Direct yt-dlp download failed: {e}")
 
-        # Attempt 4: Try SocialKit Cloud API (if free YouTube methods failed on cloud IP)
+        # Attempt 3: Try Piped Proxy API (useful when running on blocked cloud IPs)
+        if not info and yt_video_id:
+            logger.info(f"Trying Piped API for {yt_video_id}...")
+            await status_msg.edit_text("🔄 Trying cloud proxy...")
+            info = await download_via_piped(yt_video_id, timestamp)
+
+        # Attempt 4: Try SocialKit Cloud API
         if not info and yt_video_id and SOCIALKIT_ACCESS_KEY:
-            logger.info(f"Free streams restricted. Deploying SocialKit API for video ID {yt_video_id}...")
+            logger.info(f"Deploying SocialKit API for video ID {yt_video_id}...")
             await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
             info = await download_via_socialkit(f"https://www.youtube.com/watch?v={yt_video_id}", yt_video_id, timestamp)
 
-        # Attempt 5: SoundCloud Backup (Absolute last resort only if all YouTube sources failed!)
+        # Attempt 5: SoundCloud Backup (absolute last resort)
         if not info and fallback_query:
-            logger.info(f"YouTube methods failed. Searching SoundCloud for: {fallback_query}")
-            await status_msg.edit_text("⚡ Final fallback: Searching SoundCloud...")
+            logger.info(f"All YouTube methods failed. Trying SoundCloud for: {fallback_query}")
+            await status_msg.edit_text("⚡ Final fallback: SoundCloud...")
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
             except Exception as e:
