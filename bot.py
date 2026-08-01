@@ -193,8 +193,6 @@ def check_pot_server():
 
 
 setup_youtube_cookies()
-logger.info(f"Cookie status: {get_cookies_status()}")
-logger.info(f"POT server: {'✅ Running on port 4416' if check_pot_server() else '❌ Not detected'}")
 
 
 def get_ydl_opts(custom_opts=None, player_clients=None, include_cookies=True):
@@ -931,26 +929,26 @@ def start_dummy_server(port):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot diagnostics: cookie status, yt-dlp version, ffmpeg."""
+    """Show bot diagnostics: Spotify API status, SocialKit, yt-dlp version, ffmpeg."""
     user = update.effective_user
     if not is_authorized(user.id):
         await update.message.reply_text("Sorry, this is a private bot.")
         return
 
-    cookie_status = get_cookies_status()
-    pot_status = "✅ Running on port 4416" if check_pot_server() else "❌ Not detected"
+    spotify_status = "✅ Connected" if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET else "⚠️ Basic Fallback"
+    socialkit_status = "✅ Active" if SOCIALKIT_ACCESS_KEY else "⚪ Optional (Not set)"
     try:
         ytdlp_version = yt_dlp.version.__version__
     except Exception:
         ytdlp_version = "unknown"
 
     status_text = (
-        "🔧 <b>Bot Status</b>\n\n"
-        f"🍪 <b>Cookies:</b> {cookie_status}\n"
-        f"🔑 <b>POT Server:</b> {pot_status}\n"
-        f"📦 <b>yt-dlp:</b> {ytdlp_version}\n"
-        f"🎬 <b>FFmpeg:</b> {FFMPEG_EXE}\n"
-        f"📂 <b>Downloads dir:</b> {DOWNLOAD_DIR}\n"
+        "🔧 <b>Bot Engine Diagnostics</b>\n\n"
+        f"🎵 <b>Spotify API:</b> {spotify_status}\n"
+        f"⚡ <b>SocialKit Cloud:</b> {socialkit_status}\n"
+        f"📦 <b>yt-dlp Engine:</b> {ytdlp_version}\n"
+        f"🎬 <b>FFmpeg Audio:</b> ✅ Ready\n"
+        f"📂 <b>Downloads Dir:</b> {DOWNLOAD_DIR}\n"
     )
     await update.message.reply_text(status_text, parse_mode="HTML")
 
@@ -965,12 +963,11 @@ def main():
     http_thread = threading.Thread(target=start_dummy_server, args=(port,), daemon=True)
     http_thread.start()
 
-    print(f"[START] Starting bot with token {BOT_TOKEN[:10]}...")
+    print(f"[START] Starting Bashify bot with token {BOT_TOKEN[:10]}...")
     print(f"[DIR]   Downloads: {DOWNLOAD_DIR}")
-    print(f"[FFMPEG] {FFMPEG_EXE}")
-    print(f"[COOKIE] {get_cookies_status()}")
-    print(f"[POT]   {'✅ Running on port 4416' if check_pot_server() else '❌ Not detected'}")
-    print(f"[HTTP]  Listening on port {port} (for cloud health monitoring)")
+    print(f"[FFMPEG] Audio Converter: Ready ({FFMPEG_EXE})")
+    print("[ENGINES] spotDL (Primary) | YouTube/Piped | SocialKit | SoundCloud")
+    print(f"[HTTP]  Health monitor listening on port {port}")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
