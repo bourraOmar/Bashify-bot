@@ -210,18 +210,36 @@ def get_ydl_opts(custom_opts=None, player_clients=None, include_cookies=True):
 
 
 async def search_music(query: str, count: int = TOTAL_RESULTS):
-    """Search for music using YouTube first (with secret Gist cookies), falling back to clean SoundCloud search."""
+    """Search for music using Spotify first (clean official titles and artists), falling back to SoundCloud and YouTube."""
     def _search():
-        # 1. Try YouTube search first (uses Gist cookies if available)
+        # 1. Try Spotify search first!
         try:
-            yt_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
-            with yt_dlp.YoutubeDL(yt_opts) as ydl:
-                res = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
-                if res and res.get("entries"):
-                    logger.info(f"YouTube search returned {len(res['entries'])} results.")
-                    return res
+            from spotdl.utils.spotify import SpotifyClient
+            if not SpotifyClient._instance:
+                SpotifyClient.init(client_id="", client_secret="")
+            client = SpotifyClient()
+            res = client.search(query, limit=count, type="track")
+            entries = []
+            for item in res.get("tracks", {}).get("items", []):
+                title = item.get("name", "Unknown Title")
+                artist = item.get("artists", [{}])[0].get("name", "Unknown Artist")
+                sp_url = item.get("external_urls", {}).get("spotify")
+                duration = item.get("duration_ms", 0) // 1000
+                entries.append({
+                    "id": item.get("id"),
+                    "title": f"{artist} - {title}" if artist not in title else title,
+                    "artist": artist,
+                    "uploader": artist,
+                    "duration": duration,
+                    "url": sp_url,
+                    "webpage_url": sp_url,
+                    "source": "spotify"
+                })
+            if entries:
+                logger.info(f"Spotify search returned {len(entries)} results.")
+                return {"entries": entries}
         except Exception as e:
-            logger.warning(f"YouTube search errored or blocked ({e}), switching to SoundCloud...")
+            logger.warning(f"Spotify search errored ({e}), switching to SoundCloud...")
 
         # 2. Fallback to clean SoundCloud search without YouTube cookie/extractor parameters
         try:
@@ -234,6 +252,14 @@ async def search_music(query: str, count: int = TOTAL_RESULTS):
         except Exception as e2:
             logger.error(f"SoundCloud search failed as well: {e2}")
             
+        # 3. Last fallback: YouTube search
+        try:
+            yt_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+            with yt_dlp.YoutubeDL(yt_opts) as ydl:
+                return ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+        except Exception as e3:
+            logger.error(f"All music search methods failed: {e3}")
+
         return {"entries": []}
 
     return await asyncio.get_event_loop().run_in_executor(None, _search)
@@ -672,11 +698,12 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         info = None
         last_error = "Could not download stream."
 
-        # Attempt 1: For Spotify URLs, use spotDL directly
-        if "spotify.com" in str(url):
-            logger.info(f"Spotify link detected ({url}). Using spotDL...")
-            await status_msg.edit_text("🎵 Downloading Spotify track with spotDL...")
-            info = await download_via_spotdl(url, timestamp)
+        # Step 1: Guaranteed metadata resolution for Spotify links
+        if not fallback_query and "spotify.com" in str(url):
+            fallback_query = await parse_spotify_url(url)
+            logger.info(f"Resolved Spotify link metadata: {fallback_query}")
+        elif not fallback_query and message.text and not message.text.strip().startswith("http"):
+            fallback_query = message.text.strip()
 
         # Extract YouTube video ID if applicable
         yt_video_id = None
@@ -684,72 +711,59 @@ async def download_and_send(message, url: str, fallback_query: str = None):
         if yt_match:
             yt_video_id = yt_match.group(1)
 
-        # Attempt 2: For YouTube URLs, try Piped API FIRST (datacenter IPs are always blocked by YouTube)
+        # Attempt 1: For Spotify URLs or text queries, try spotDL first
+        if "spotify.com" in str(url) or fallback_query:
+            target = url if "spotify.com" in str(url) else fallback_query
+            logger.info(f"Trying spotDL for: {target}")
+            await status_msg.edit_text("🎵 Downloading high-quality audio with spotDL...")
+            info = await download_via_spotdl(target, timestamp)
+
+        # Attempt 2: For YouTube URLs, try Piped API first
         if not info and yt_video_id:
             logger.info(f"YouTube video detected ({yt_video_id}). Trying Piped API first...")
             await status_msg.edit_text("🔄 Fetching audio stream...")
             info = await download_via_piped(yt_video_id, timestamp)
 
-        # Attempt 3: Direct yt-dlp download (for SoundCloud URLs or if Piped failed)
-        if not info and "spotify.com" not in str(url):
+        # Attempt 3: Direct yt-dlp download (for SoundCloud URLs or direct audio links)
+        if not info and "spotify.com" not in str(url) and not fallback_query:
             logger.info(f"Trying direct yt-dlp download for {url}...")
-            if yt_video_id:
-                await status_msg.edit_text("🔄 Trying direct YouTube stream...")
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
             except Exception as e:
-                last_error = str(e)
                 logger.warning(f"Direct yt-dlp download failed for {url}: {e}")
 
-        # Attempt 4: Try spotDL free fallback before consuming paid API credits!
+        # Attempt 4: SoundCloud Cloud Backup (UNBLOCKABLE fallback when spotDL is blocked on cloud servers)
         if not info and fallback_query:
-            logger.info(f"Primary methods failed. Trying spotDL fallback for: {fallback_query}...")
-            await status_msg.edit_text("⚡ Switching to spotDL audio downloader...")
-            info = await download_via_spotdl(fallback_query, timestamp)
+            logger.info(f"spotDL blocked or restricted. Trying SoundCloud for: {fallback_query}")
+            await status_msg.edit_text("⚡ Cloud server fallback: Searching SoundCloud...")
+            try:
+                info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
+            except Exception as e:
+                logger.warning(f"scsearch1 failed: {e}")
+                clean_query = re.sub(r"[\(\[].*?[\)\]]", "", fallback_query).split("-")[0].strip()
+                try:
+                    info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{clean_query}")
+                except Exception as e2:
+                    last_error = f"SoundCloud search failed: {e2}"
 
-        # Attempt 5: Try SocialKit API (if configured in .env and free methods failed)
-        if not info and yt_video_id and SOCIALKIT_ACCESS_KEY:
-            logger.info(f"Free methods failed. Trying SocialKit API for {url}...")
-            await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
-            info = await download_via_socialkit(url, yt_video_id, timestamp)
+        # Attempt 5: Try SocialKit API (if configured in .env and we have or can find a YouTube ID)
+        if not info and SOCIALKIT_ACCESS_KEY:
+            if not yt_video_id and fallback_query:
+                try:
+                    search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+                    def _yt_find():
+                        with yt_dlp.YoutubeDL(search_opts) as ydl:
+                            return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
+                    s_res = await asyncio.get_event_loop().run_in_executor(None, _yt_find)
+                    if s_res and s_res.get("entries"):
+                        yt_video_id = s_res["entries"][0].get("id")
+                except Exception as e:
+                    logger.warning(f"Could not find YouTube ID for SocialKit: {e}")
 
-        # Attempt 6: Cross-platform fallback (SoundCloud / YouTube search)
-        if not info:
-            if not fallback_query and message.text and not message.text.strip().startswith("http"):
-                fallback_query = message.text.strip()
-
-            if fallback_query:
-                if yt_video_id or "youtube" in str(url) or "spotify" in str(url):
-                    logger.info(f"Primary sources restricted. Switching to SoundCloud for: {fallback_query}")
-                    await status_msg.edit_text("⚡ Switching to SoundCloud alternative audio...")
-                    try:
-                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
-                    except Exception as e:
-                        logger.warning(f"scsearch1 failed: {e}")
-                        clean_query = fallback_query.split("-")[0].strip() if "-" in fallback_query else fallback_query[:30]
-                        try:
-                            info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{clean_query}")
-                        except Exception as e2:
-                            last_error = f"SoundCloud search failed: {e2}"
-                else:
-                    logger.info(f"SoundCloud failed. Trying YouTube search for: {fallback_query}")
-                    await status_msg.edit_text("⚡ Switching to YouTube stream...")
-                    try:
-                        info = await asyncio.get_event_loop().run_in_executor(None, _download, f"ytsearch1:{fallback_query}")
-                    except Exception as e:
-                        logger.warning(f"ytsearch1 failed: {e}. Trying Piped search...")
-                        try:
-                            search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
-                            def _yt_search():
-                                with yt_dlp.YoutubeDL(search_opts) as ydl:
-                                    return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
-                            search_res = await asyncio.get_event_loop().run_in_executor(None, _yt_search)
-                            if search_res and search_res.get("entries"):
-                                found_id = search_res["entries"][0].get("id")
-                                if found_id:
-                                    info = await download_via_piped(found_id, timestamp)
-                        except Exception as e2:
-                            last_error = f"YouTube fallback failed: {e2}"
+            if yt_video_id:
+                logger.info(f"Trying SocialKit API for video ID {yt_video_id}...")
+                await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
+                info = await download_via_socialkit(f"https://www.youtube.com/watch?v={yt_video_id}", yt_video_id, timestamp)
 
         # Unpack playlist / search entry if needed
         if info and isinstance(info, dict) and info.get("entries"):
