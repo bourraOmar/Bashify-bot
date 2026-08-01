@@ -434,7 +434,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_id = entry.get("id", "")
         title = entry.get("title", "")
         artist = entry.get("uploader") or entry.get("artist", "")
-        fallback_query = f"{title} {artist}".strip()
+        fallback_query = title if artist.lower() in title.lower() else f"{artist} - {title}".strip()
 
         if not url or not str(url).startswith("http"):
             if str(video_id).isdigit():
@@ -728,24 +728,49 @@ async def download_and_send(message, url: str, fallback_query: str = None):
             await status_msg.edit_text("🎵 Downloading high-quality audio with spotDL...")
             info = await download_via_spotdl(target, timestamp)
 
-        # Attempt 2: For YouTube URLs, try Piped API first
+        # Step 2: If spotDL failed or it's not a Spotify link, secure a YouTube Video ID for exact title matching!
+        if not info and not yt_video_id and fallback_query:
+            logger.info(f"spotDL missed or restricted. Finding exact YouTube ID for: {fallback_query}")
+            try:
+                search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
+                def _yt_find():
+                    with yt_dlp.YoutubeDL(search_opts) as ydl:
+                        return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
+                s_res = await asyncio.get_event_loop().run_in_executor(None, _yt_find)
+                if s_res and s_res.get("entries") and s_res["entries"][0] is not None:
+                    yt_video_id = s_res["entries"][0].get("id")
+                    logger.info(f"Found exact YouTube video match: {yt_video_id}")
+            except Exception as e:
+                logger.warning(f"Could not find YouTube ID for query: {e}")
+
+        # Attempt 2: Try Piped Proxy API (free cloud proxy for YouTube audio)
         if not info and yt_video_id:
-            logger.info(f"YouTube video detected ({yt_video_id}). Trying Piped API first...")
-            await status_msg.edit_text("🔄 Fetching audio stream...")
+            logger.info(f"YouTube video ID ({yt_video_id}) ready. Trying Piped API...")
+            await status_msg.edit_text("🔄 Fetching YouTube audio via Piped proxy...")
             info = await download_via_piped(yt_video_id, timestamp)
 
-        # Attempt 3: Direct yt-dlp download (for SoundCloud URLs or direct audio links)
-        if not info and "spotify.com" not in str(url) and not fallback_query:
-            logger.info(f"Trying direct yt-dlp download for {url}...")
-            try:
-                info = await asyncio.get_event_loop().run_in_executor(None, _download, url)
-            except Exception as e:
-                logger.warning(f"Direct yt-dlp download failed for {url}: {e}")
+        # Attempt 3: Direct yt-dlp download (works perfectly when running locally on your PC!)
+        if not info:
+            target_url = f"https://www.youtube.com/watch?v={yt_video_id}" if yt_video_id else url
+            if "spotify.com" not in str(target_url):
+                logger.info(f"Trying direct yt-dlp stream for {target_url}...")
+                await status_msg.edit_text("🔄 Downloading audio stream directly...")
+                try:
+                    info = await asyncio.get_event_loop().run_in_executor(None, _download, target_url)
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"Direct yt-dlp download failed: {e}")
 
-        # Attempt 4: SoundCloud Cloud Backup (UNBLOCKABLE fallback when spotDL is blocked on cloud servers)
+        # Attempt 4: Try SocialKit Cloud API (if free YouTube methods failed on cloud IP)
+        if not info and yt_video_id and SOCIALKIT_ACCESS_KEY:
+            logger.info(f"Free streams restricted. Deploying SocialKit API for video ID {yt_video_id}...")
+            await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
+            info = await download_via_socialkit(f"https://www.youtube.com/watch?v={yt_video_id}", yt_video_id, timestamp)
+
+        # Attempt 5: SoundCloud Backup (Absolute last resort only if all YouTube sources failed!)
         if not info and fallback_query:
-            logger.info(f"spotDL blocked or restricted. Trying SoundCloud for: {fallback_query}")
-            await status_msg.edit_text("⚡ Cloud server fallback: Searching SoundCloud...")
+            logger.info(f"YouTube methods failed. Searching SoundCloud for: {fallback_query}")
+            await status_msg.edit_text("⚡ Final fallback: Searching SoundCloud...")
             try:
                 info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{fallback_query}")
             except Exception as e:
@@ -755,25 +780,6 @@ async def download_and_send(message, url: str, fallback_query: str = None):
                     info = await asyncio.get_event_loop().run_in_executor(None, _download, f"scsearch1:{clean_query}")
                 except Exception as e2:
                     last_error = f"SoundCloud search failed: {e2}"
-
-        # Attempt 5: Try SocialKit API (if configured in .env and we have or can find a YouTube ID)
-        if not info and SOCIALKIT_ACCESS_KEY:
-            if not yt_video_id and fallback_query:
-                try:
-                    search_opts = get_ydl_opts({"extract_flat": "in_playlist"}, include_cookies=True)
-                    def _yt_find():
-                        with yt_dlp.YoutubeDL(search_opts) as ydl:
-                            return ydl.extract_info(f"ytsearch1:{fallback_query}", download=False)
-                    s_res = await asyncio.get_event_loop().run_in_executor(None, _yt_find)
-                    if s_res and s_res.get("entries"):
-                        yt_video_id = s_res["entries"][0].get("id")
-                except Exception as e:
-                    logger.warning(f"Could not find YouTube ID for SocialKit: {e}")
-
-            if yt_video_id:
-                logger.info(f"Trying SocialKit API for video ID {yt_video_id}...")
-                await status_msg.edit_text("⚡ Using SocialKit Cloud API...")
-                info = await download_via_socialkit(f"https://www.youtube.com/watch?v={yt_video_id}", yt_video_id, timestamp)
 
         # Unpack playlist / search entry if needed
         if info and isinstance(info, dict) and info.get("entries"):
