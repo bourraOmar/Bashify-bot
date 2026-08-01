@@ -660,11 +660,28 @@ async def download_via_spotdl(query_or_url: str, timestamp: int) -> dict:
         filename = os.path.basename(file_path)
         track_id = filename.split(".")[0]
 
+        title = query_or_url if not query_or_url.startswith("http") else "Audio Track"
+        artist = "Unknown Artist"
+        duration = 0
+
+        try:
+            import mutagen
+            meta = mutagen.File(file_path, easy=True)
+            if meta:
+                if "title" in meta and meta["title"]:
+                    title = meta["title"][0]
+                if "artist" in meta and meta["artist"]:
+                    artist = meta["artist"][0]
+                if getattr(meta, "info", None) and getattr(meta.info, "length", 0) > 0:
+                    duration = int(meta.info.length)
+        except Exception as e:
+            logger.warning(f"Metadata read failed for spotdl file: {e}")
+
         return {
             "id": track_id,
-            "title": query_or_url if not query_or_url.startswith("http") else "Spotify Track",
-            "uploader": "Spotify / spotDL",
-            "duration": 0,
+            "title": title,
+            "uploader": artist,
+            "duration": duration,
             "source": "spotdl",
             "pre_converted_mp3": file_path,
         }
@@ -839,6 +856,20 @@ async def download_and_send(message, url: str, fallback_query: str = None):
             if thumbs:
                 thumb_path = thumbs[0]
                 break
+
+        # Final metadata enhancement: extract exact tags directly from MP3 if available
+        try:
+            import mutagen
+            meta = mutagen.File(mp3_path, easy=True)
+            if meta:
+                if "title" in meta and meta["title"]:
+                    title = meta["title"][0]
+                if "artist" in meta and meta["artist"]:
+                    artist = meta["artist"][0]
+                if getattr(meta, "info", None) and getattr(meta.info, "length", 0) > 0:
+                    duration = int(meta.info.length)
+        except Exception as e:
+            logger.warning(f"Final metadata read failed for {mp3_path}: {e}")
 
         # Step 3: Upload to Telegram (with increased timeout for slow connections)
         await status_msg.edit_text("Uploading to Telegram...")
