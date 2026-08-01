@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Music Downloader Bot
 cd /d "%~dp0"
 echo ===========================================
