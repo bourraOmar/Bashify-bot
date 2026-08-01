@@ -630,12 +630,9 @@ async def download_via_socialkit(url: str, video_id: str, timestamp: int) -> dic
 
 async def download_via_spotdl(query_or_url: str, timestamp: int) -> dict:
     """Download audio with spotDL (free, embeds ID3 lyrics and artwork from Spotify)."""
-    import shutil
-    spotdl_exe = shutil.which("spotdl") or "spotdl"
-
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"spotdl_{timestamp}_{{track-id}}.{{output-ext}}")
     cmd = [
-        spotdl_exe,
+        sys.executable, "-m", "spotdl",
         query_or_url,
         "--format", "mp3",
         "--output", out_tmpl,
@@ -808,22 +805,26 @@ async def download_and_send(message, url: str, fallback_query: str = None):
                 return
 
             raw_path = raw_audio[0]
-            await status_msg.edit_text("Converting to MP3...")
+            if os.path.abspath(raw_path) == os.path.abspath(mp3_path) or raw_path.lower().endswith(".mp3"):
+                mp3_path = raw_path
+                logger.info(f"Downloaded audio is already MP3: {mp3_path}")
+            else:
+                await status_msg.edit_text("Converting to MP3...")
 
-            def _convert():
-                cmd = [
-                    FFMPEG_EXE, "-i", raw_path,
-                    "-vn", "-ab", "192k", "-ar", "44100", "-y",
-                    mp3_path
-                ]
-                return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                def _convert():
+                    cmd = [
+                        FFMPEG_EXE, "-i", raw_path,
+                        "-vn", "-ab", "192k", "-ar", "44100", "-y",
+                        mp3_path
+                    ]
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-            convert_result = await asyncio.get_event_loop().run_in_executor(None, _convert)
+                convert_result = await asyncio.get_event_loop().run_in_executor(None, _convert)
 
-            if convert_result.returncode != 0 or not os.path.isfile(mp3_path):
-                logger.error(f"FFmpeg error: {convert_result.stderr[:500]}")
-                await status_msg.edit_text("MP3 conversion failed.")
-                return
+                if convert_result.returncode != 0 or not os.path.isfile(mp3_path):
+                    logger.error(f"FFmpeg error: {convert_result.stderr[-500:]}")
+                    await status_msg.edit_text("MP3 conversion failed.")
+                    return
 
         # Find thumbnail
         thumb_path = None
